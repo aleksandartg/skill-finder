@@ -2,8 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 const PANE = 'skill-finder'
-const CATALOG = 'D:/Z6III/SKILLS.md'
-const PROJECTS = ['All', 'Site', 'Frames', 'Influencers', 'Biz', 'Photo']
+const DEFAULT_CATALOG = '~/.claude/SKILLS.md'
 const MAX_SHOWN = 60
 
 const query = atom({ plugin: 'skill-finder', key: 'query' } as const, '', { shape: 'query-1' })
@@ -14,24 +13,34 @@ type Skill = {
   category: string
   desc: string
   useful: string
-  where: string
   projects: string[]
   loaded: boolean
 }
 
-type Catalog = { rows: Omit<Skill, 'loaded'>[]; picks: Map<string, Set<string>> }
+type Row = Omit<Skill, 'loaded' | 'projects'>
+type Catalog = { rows: Row[]; picks: Map<string, Set<string>>; projects: string[] }
+type Loaded = { at: number; skills: Skill[]; projects: string[]; catalogPath: string; hasCatalog: boolean }
 
-let cache: { at: number; skills: Skill[]; error?: string } | undefined
+let cache: Loaded | undefined
 
 const cells = (line: string) => line.split('|').slice(1, -1).map(c => c.trim())
 const ticks = (text: string) => [...text.matchAll(/`([^`]+)`/g)].map(m => (m[1] ?? '').replace(/^\//, ''))
 const strip = (text: string) => text.replace(/`/g, '').replace(/\*\*/g, '').trim()
 const short = (name: string) => name.split(':').pop() ?? name
+const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
+/**
+ * Reads a skills catalog written as Markdown tables:
+ * - `## <Category>` headings (an optional `1.` number is dropped);
+ * - tables whose first column holds `skill-name` in backticks, with optional
+ *   `What it does` and `Useful in` columns;
+ * - one table headed `Project | ...` whose rows tag skills with a project.
+ */
 function parseCatalog(md: string): Catalog {
-  const rows: Catalog['rows'] = []
+  const rows: Row[] = []
   const picks = new Map<string, Set<string>>()
-  let category = ''
+  const projects: string[] = []
+  let category = 'Skills'
   let header: string[] = []
   const lines = md.split(/\r?\n/)
   for (let i = 0; i < lines.length; i++) {
@@ -39,16 +48,18 @@ function parseCatalog(md: string): Catalog {
     const h = line.match(/^##\s+(?:\d+\.\s*)?(.+)$/)
     if (h) { category = (h[1] ?? '').trim(); header = []; continue }
     if (!line.startsWith('|')) { header = []; continue }
-    if (/^\|\s*-/.test(line)) continue
-    if (header.length === 0 && /^\|\s*-/.test(lines[i + 1] ?? '')) { header = cells(line); continue }
+    if (/^\|\s*:?-/.test(line)) continue
+    if (header.length === 0 && /^\|\s*:?-/.test(lines[i + 1] ?? '')) { header = cells(line); continue }
     const row = cells(line)
     const col = (title: string) => {
       const at = header.findIndex(x => x.toLowerCase() === title.toLowerCase())
       return at >= 0 ? row[at] ?? '' : ''
     }
-    if (header[0] === 'Project') {
+    if ((header[0] ?? '').toLowerCase() === 'project') {
       const proj = strip(row[0] ?? '')
-      for (const n of ticks(row[1] ?? '')) {
+      if (!proj) continue
+      if (!projects.includes(proj)) projects.push(proj)
+      for (const n of ticks(row.slice(1).join(' '))) {
         if (!picks.has(n)) picks.set(n, new Set())
         picks.get(n)!.add(proj)
       }
@@ -58,53 +69,67 @@ function parseCatalog(md: string): Catalog {
     if (names.length === 0) continue
     const base = (names[0] ?? '').split('-')[0] ?? ''
     for (const raw of names) {
-      const name = raw.startsWith('-') ? base + raw : raw
       rows.push({
-        name,
+        name: raw.startsWith('-') ? base + raw : raw,
         category,
-        desc: strip(col('What it does')),
+        desc: strip(col('What it does') || col('Description') || col('Purpose')),
         useful: strip(col('Useful in')),
-        where: strip(col('Where')),
-        projects: [],
       })
     }
   }
-  return { rows, picks }
+  return { rows, picks, projects }
 }
 
-async function loadSkills($: EngineInterface): Promise<NonNullable<typeof cache>> {
+async function catalogPath($: EngineInterface, setting: string): Promise<string> {
+  const path = setting.trim() || DEFAULT_CATALOG
+  if (!path.startsWith('~')) return path
+  const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || ''
+  return home.replace(/[\\/]+$/, '') + path.slice(1)
+}
+
+async function loadSkills($: EngineInterface, setting: string): Promise<Loaded> {
   if (cache && Date.now() - cache.at < 60_000) return cache
-  let catalog: Catalog = { rows: [], picks: new Map() }
-  let error: string | undefined
+  const path = await catalogPath($, setting)
+  let catalog: Catalog = { rows: [], picks: new Map(), projects: [] }
+  let hasCatalog = false
   try {
-    catalog = parseCatalog(await $.fs.read(CATALOG))
+    catalog = parseCatalog(await $.fs.read(path))
+    hasCatalog = catalog.rows.length > 0
   } catch {
-    error = `Could not read ${CATALOG}; showing installed skills only.`
+    // No catalog: every installed skill is still listed, grouped by where it comes from.
   }
+
   const commands = await $.command.list()
   const live = new Map<string, string>()
   for (const c of commands) {
     live.set(c.name, c.name)
     if (!live.has(short(c.name))) live.set(short(c.name), c.name)
   }
+
+  const tag = (name: string, useful: string) =>
+    catalog.projects.filter(
+      p => catalog.picks.get(name)?.has(p) || new RegExp(`(^|\\W)${escape(p)}(\\W|$)`, 'i').test(useful),
+    )
+
   const seen = new Set<string>()
   const skills: Skill[] = catalog.rows.map(r => {
     const invoke = live.get(r.name)
     if (invoke) seen.add(invoke)
-    const projects = PROJECTS.filter(
-      p => p !== 'All' && (catalog.picks.get(r.name)?.has(p) || new RegExp(`\\b${p}\\b`, 'i').test(r.useful)),
-    )
-    return { ...r, name: invoke ?? r.name, projects, loaded: Boolean(invoke) }
+    return { ...r, name: invoke ?? r.name, projects: tag(r.name, r.useful), loaded: Boolean(invoke) }
   })
   for (const c of commands) {
-    if (seen.has(c.name) || (c.source !== 'user' && c.source !== 'plugin')) continue
-    if (c.name.startsWith('skill-finder')) continue
+    if (seen.has(c.name) || c.name.startsWith('skill-finder')) continue
+    if (c.source !== 'user' && c.source !== 'plugin') continue
     skills.push({
-      name: c.name, category: 'Not in the catalog yet', desc: c.description, useful: '', where: c.source,
-      projects: [], loaded: true,
+      name: c.name,
+      category: hasCatalog ? 'Not in your catalog yet' : c.source === 'user' ? 'Your skills' : 'Plugin skills',
+      desc: c.description,
+      useful: '',
+      projects: tag(short(c.name), ''),
+      loaded: true,
     })
   }
-  cache = { at: Date.now(), skills, error }
+  cache = { at: Date.now(), skills, projects: catalog.projects, catalogPath: path, hasCatalog }
   return cache
 }
 
@@ -114,7 +139,9 @@ function matches(s: Skill, q: string, proj: string) {
   return q.toLowerCase().split(/\s+/).filter(Boolean).every(w => hay.includes(w))
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const setting = typeof options.catalog === 'string' ? options.catalog : ''
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'skill-finder',
@@ -134,8 +161,9 @@ export const register: Register = on => {
     const { Box, Text, Button } = els
     const Input = 'Input' in els ? els.Input : undefined
     const q = await read($, query)
-    const proj = await read($, project)
-    const { skills, error } = await loadSkills($)
+    const { skills, projects, catalogPath: path, hasCatalog } = await loadSkills($, setting)
+    const storedProj = await read($, project)
+    const proj = storedProj === 'All' || projects.includes(storedProj) ? storedProj : 'All'
     const hits = skills.filter(s => matches(s, q, proj))
 
     const groups = new Map<string, Skill[]>()
@@ -154,7 +182,7 @@ export const register: Register = on => {
         {Input ? (
           <Input
             key="search"
-            placeholder="Search skills: video, captions, website, pdf..."
+            placeholder="Search skills by name, purpose or project..."
             value={q}
             submitLabel="search"
             autoFocus
@@ -162,34 +190,40 @@ export const register: Register = on => {
             onSubmit={(value: string) => void update($, query, () => value)}
           />
         ) : (
-          <Text dimColor size="footnote">Search needs the desktop app or terminal; use the project filters here.</Text>
+          <Text dimColor size="footnote">Search needs the desktop app or terminal.</Text>
         )}
-        <Box flexDirection="row" flexWrap="wrap" gap="xs">
-          {PROJECTS.map(p => (
-            <Button
-              key={`p:${p}`}
-              label={p}
-              variant={p === proj ? 'primary' : undefined}
-              dimColor={p !== proj}
-              onPress={() => update($, project, () => p)}
-            />
-          ))}
-          {(q || proj !== 'All') && (
-            <Button
-              key="clear"
-              label="Clear"
-              dimColor
-              onPress={async () => {
-                await update($, query, () => '')
-                await update($, project, () => 'All')
-              }}
-            />
-          )}
-        </Box>
+        {projects.length > 0 && (
+          <Box flexDirection="row" flexWrap="wrap" gap="xs">
+            {['All', ...projects].map(p => (
+              <Button
+                key={`p:${p}`}
+                label={p}
+                variant={p === proj ? 'primary' : undefined}
+                dimColor={p !== proj}
+                onPress={() => update($, project, () => p)}
+              />
+            ))}
+          </Box>
+        )}
+        {(q || proj !== 'All') && (
+          <Button
+            key="clear"
+            label="Clear search"
+            dimColor
+            onPress={async () => {
+              await update($, query, () => '')
+              await update($, project, () => 'All')
+            }}
+          />
+        )}
         <Text dimColor size="footnote">
           {hits.length} of {skills.length} skills{hits.length > MAX_SHOWN ? `, first ${MAX_SHOWN} shown` : ''}. Click one to put it in your prompt.
         </Text>
-        {error && <Text color="warning" size="footnote">{error}</Text>}
+        {!hasCatalog && (
+          <Text dimColor size="footnote">
+            Optional: write a catalog at {path} to add categories, project filters and notes (format in the mod's README).
+          </Text>
+        )}
         {hits.length === 0 && <Text dimColor>No skill matches. Try a shorter word or pick All.</Text>}
         {[...groups].map(([cat, list]) => (
           <Box key={`g:${cat}`} flexDirection="column" gap="xs">
@@ -199,7 +233,7 @@ export const register: Register = on => {
                 <Button key={`b:${s.name}`} label={`/${s.name}`} plain onPress={choose(s)} />
                 {s.desc && <Text size="footnote">{s.desc}</Text>}
                 {s.useful && <Text dimColor size="footnote">Use in: {s.useful}</Text>}
-                {!s.loaded && <Text color="warning" size="footnote">Not available in this session</Text>}
+                {!s.loaded && <Text color="warning" size="footnote">Not installed or not loaded in this session</Text>}
               </Box>
             ))}
           </Box>

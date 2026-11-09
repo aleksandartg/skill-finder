@@ -1,1 +1,15 @@
-{ "name": "skill-finder", "version": "0.1.0", "description": "Searchable skills panel: filter by project, click a skill to put /skill-name in the prompt", "types": "./types/index.d.ts" }
+{
+  "name": "skill-finder",
+  "version": "0.2.0",
+  "description": "Searchable skills panel: lists your installed skills, optional catalog adds categories and project filters; click a skill to put /skill-name in the prompt",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "catalog": {
+      "type": "string",
+      "title": "Skills catalog file",
+      "description": "Optional Markdown catalog that adds categories, notes and project filters. Leave empty for ~/.claude/SKILLS.md. ~ means your home folder.",
+      "default": "",
+      "required": false
+    }
+  }
+}
