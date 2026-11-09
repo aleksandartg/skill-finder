@@ -25,7 +25,7 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 Answer `y` to add the marketplace, then pick the user scope. Then type `/skill-finder`.
 
-This repository is private: it installs only for people who can read it on GitHub and whose computer already has a git login for github.com (an SSH key, or `gh auth login` then `gh auth setup-git`). The install never asks for one.
+No GitHub account or login is needed to install it.
 
 ## Optional: your own catalog
 
