@@ -1,0 +1,1 @@
+{ "name": "skill-finder", "version": "0.1.0", "description": "Searchable skills panel: filter by project, click a skill to put /skill-name in the prompt", "types": "./types/index.d.ts" }
